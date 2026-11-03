@@ -1,6 +1,9 @@
 const express = require('express');
 const multer = require('multer');
-const { xsltProcess, xmlParse } = require('xslt-processor');
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
+const xsltproc = require('xsltproc');
 
 const app = express();
 const upload = multer({ storage: multer.memoryStorage() });
@@ -8,7 +11,7 @@ const upload = multer({ storage: multer.memoryStorage() });
 app.post('/transform', upload.any(), (req, res) => {
   try {
     if (!req.files || req.files.length < 2) {
-      return res.status(400).send('Servono 2 file: il file XML della fattura e il foglio XSLT.');
+      return res.status(400).send('File xml o xslt mancanti');
     }
 
     const xmlFile = req.files.find(f => f.fieldname.toLowerCase().includes('xml') || f.originalname.toLowerCase().endsWith('.xml'));
@@ -18,19 +21,30 @@ app.post('/transform', upload.any(), (req, res) => {
       return res.status(400).send('Impossibile identificare XML e XSL.');
     }
 
-    const xmlString = xmlFile.buffer.toString('utf-8');
-    const xslString = xslFile.buffer.toString('utf-8');
+    const tmpDir = os.tmpdir();
+    const xmlPath = path.join(tmpDir, `doc_${Date.now()}.xml`);
+    const xslPath = path.join(tmpDir, `style_${Date.now()}.xsl`);
 
-    // Chiamata corretta senza costruttori 'new'
-    const xmlDoc = xmlParse(xmlString);
-    const xsltDoc = xmlParse(xslString);
-    const htmlResult = xsltProcess(xmlDoc, xsltDoc);
+    fs.writeFileSync(xmlPath, xmlFile.buffer);
+    fs.writeFileSync(xslPath, xslFile.buffer);
 
-    res.setHeader('Content-Type', 'text/html; charset=utf-8');
-    return res.status(200).send(htmlResult);
+    const xs = xsltproc();
+    xs.transform(xslPath, xmlPath, (err, stdout, stderr) => {
+      // Pulizia file temporanei
+      try { fs.unlinkSync(xmlPath); } catch (e) {}
+      try { fs.unlinkSync(xslPath); } catch (e) {}
+
+      if (err) {
+        console.error('Errore xsltproc:', stderr || err.message);
+        return res.status(500).send('Errore trasformazione: ' + (stderr || err.message));
+      }
+
+      res.setHeader('Content-Type', 'text/html; charset=utf-8');
+      return res.status(200).send(stdout);
+    });
   } catch (err) {
-    console.error('Errore durante la trasformazione:', err);
-    return res.status(500).send('Errore trasformazione: ' + err.message);
+    console.error('Errore server:', err);
+    return res.status(500).send('Errore server: ' + err.message);
   }
 });
 
