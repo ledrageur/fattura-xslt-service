@@ -1,39 +1,77 @@
 import os
+import re
+import requests
 from flask import Flask, request, Response
 from lxml import etree
 
 app = Flask(__name__)
 
-@app.route('/transform', methods=['POST'])
-def transform():
-    try:
-        xml_file = None
-        xsl_file = None
+# Carica il foglio di stile locale una sola volta all'avvio
+XSLT_PATH = os.path.join(os.path.dirname(__file__), 'FoglioStileAssoSoftware.xsl')
 
-        # Ricerca automatica dei due file inviati
+@app.route('/transform', methods=['POST'])
+def transform_to_pdf():
+    try:
+        # 1. Recupera il file XML inviato
+        xml_file = None
         for key in request.files:
             f = request.files[key]
-            filename = f.filename.lower()
-            if 'xml' in key.lower() or filename.endswith('.xml'):
+            if 'xml' in key.lower() or f.filename.lower().endswith('.xml'):
                 xml_file = f
-            elif 'xsl' in key.lower() or filename.endswith('.xsl'):
-                xsl_file = f
+                break
 
-        if not xml_file or not xsl_file:
-            return "File xml o xslt mancanti", 400
+        if not xml_file:
+            return "File XML mancante", 400
 
-        # Parsing con lxml (gestisce al 100% qualsiasi costrutto XSLT 1.0/1.1)
-        xml_doc = etree.fromstring(xml_file.read())
-        xslt_doc = etree.fromstring(xsl_file.read())
+        xml_bytes = xml_file.read()
+
+        # 2. Parsing XML e rimozione namespace per estrazione dati rapida
+        xml_root = etree.fromstring(xml_bytes)
         
-        transform = etree.XSLT(xslt_doc)
-        result_tree = transform(xml_doc)
+        # Estrai Numero Fattura
+        num_doc = xml_root.xpath("//DatiGeneraliDocumento/Numero/text()")
+        num_doc_str = num_doc[0].strip() if num_doc else "SenzaNum"
+
+        # Estrai Numero Ordine (se presente)
+        num_ord = xml_root.xpath("//DatiOrdineAcquisto/IdDocumento/text()")
+        num_ord_str = f"Ord_{num_ord[0].strip()}_" if num_ord else ""
+
+        # Pulisci caratteri non validi per i nomi di file
+        safe_num_doc = re.sub(r'[\\/*?:"<>|]', '-', num_doc_str)
+        safe_num_ord = re.sub(r'[\\/*?:"<>|]', '-', num_ord_str)
+        pdf_filename = f"{safe_num_ord}Fattura_{safe_num_doc}.pdf"
+
+        # 3. Trasformazione XSLT -> HTML
+        if os.path.exists(XSLT_PATH):
+            with open(XSLT_PATH, 'rb') as f:
+                xslt_root = etree.fromstring(f.read())
+        else:
+            return f"Foglio di stile non trovato sul server: {XSLT_PATH}", 500
+
+        transform = etree.XSLT(xslt_root)
+        html_tree = transform(xml_root)
+        html_bytes = str(html_tree).encode('utf-8')
+
+        # 4. Chiamata a Gotenberg per convertire HTML in PDF
+        gotenberg_url = "https://demo.gotenberg.dev/forms/chromium/convert/html"
+        files = {
+            'files': ('index.html', html_bytes, 'text/html')
+        }
         
-        return Response(str(result_tree), mimetype='text/html')
+        res = requests.post(gotenberg_url, files=files, timeout=60)
+        
+        if res.status_code != 200:
+            return f"Errore generazione PDF da Gotenberg: {res.text}", 502
+
+        # 5. Restituisce direttamente il binario PDF
+        response = Response(res.content, mimetype='application/pdf')
+        response.headers['Content-Disposition'] = f'attachment; filename="{pdf_filename}"'
+        response.headers['X-Suggested-Filename'] = pdf_filename
+        return response
 
     except Exception as e:
-        print("Errore trasformazione:", str(e))
-        return f"Errore trasformazione: {str(e)}", 500
+        print("Errore server:", str(e))
+        return f"Errore interno: {str(e)}", 500
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5000))
